@@ -1,0 +1,10 @@
+pyorbbecsdk2==2.1.1
+pyrealsense2==2.58.2.10647
+piper-sdk==0.6.1
+
+numpy==1.26.4
+pin==4.0.0
+pin-pink==4.2.0
+qpsolvers==4.12.0
+proxsuite==0.7.3
+osqp==1.1.3

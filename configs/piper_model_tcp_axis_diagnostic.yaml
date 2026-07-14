@@ -1,0 +1,75 @@
+model:
+  checkpoint: /data/checkpoints/piper_real_20x
+  device: cuda
+  task: pick up the red plastic bottle
+  rotation: euler
+
+cameras:
+  opst_cam:
+    driver: realsense
+    enabled: false
+    serial: ""
+    width: 640
+    height: 480
+    fps: 30
+  wrist_cam:
+    driver: orbbec
+    enabled: false
+    serial: ""
+    width: 640
+    height: 480
+    fps: 30
+
+robot:
+  can_interface: can0
+  dh_is_offset: 1
+  official_can_adapter: true
+  auto_enable: true
+  command_gripper: false
+  command_speed_percent: 1
+  # Diagnostic only: use Piper firmware Cartesian MOVE P to verify whether
+  # model_to_sdk_pose() commands and sdk_to_model_pose() feedback agree in sign.
+  # This intentionally bypasses host_ik_move_j so tiny axis tests are not blocked
+  # by the host least-squares IK branch/limit checker.
+  control_backend: firmware_move_p
+  ik_position_tolerance_m: 0.002
+  ik_rotation_tolerance_rad: 0.035
+  ik_max_joint_step_deg: 5.0
+  ik_min_joint_limit_margin_deg: 0.2
+  ik_max_nfev: 60
+  ik_allow_pose_projection: false
+  ik_projection_joint_limit_margin_deg: 2.0
+  ik_projection_max_position_error_m: 0.003
+  ik_projection_max_rotation_error_rad: 0.12
+  ik_projection_position_weight: 1.0
+  ik_projection_rotation_weight: 0.25
+  sdk_to_model_translation_m: [0.0, 0.0, 0.1334]
+  sdk_to_model_euler_xyz_rad: [0.0, 0.0, 3.141592653589793]
+
+runtime:
+  mode: execute
+  control_hz: 25.0
+  camera_sync_tolerance_ms: 50.0
+  sensor_timeout_ms: 250.0
+  startup_timeout_s: 300.0
+  output_dir: deploy/runs
+  history_indices: [-2, 0]
+  record_video: false
+  video_fps: 25.0
+  max_execute_seconds: 0
+  return_to_training_start_on_normal_exit: false
+  return_speed_percent: 1
+  return_timeout_s: 45
+
+safety:
+  workspace_min_m: [0.12, -0.35, 0.04]
+  workspace_max_m: [0.60, 0.35, 0.55]
+  enforce_workspace: true
+  max_translation_step_m: 0.005
+  max_rotation_step_rad: 0.08
+  max_action_age_ms: 800.0
+  stale_action_hold_ms: 200.0
+  hold_on_stale_action: true
+  gripper_open_threshold: 0.0
+  gripper_min_m: 0.0
+  gripper_max_m: 0.07

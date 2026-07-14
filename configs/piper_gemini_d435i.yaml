@@ -1,0 +1,67 @@
+model:
+  # Directory containing config.json and model.safetensors.
+  checkpoint: /home/yuling/work_space/repos/DynamicVLA/dynamic-vla-DOM
+  device: cuda
+  task: place the object into the container
+  rotation: euler
+
+cameras:
+  opst_cam:
+    # Fixed third-person RealSense D435i.
+    driver: realsense
+    enabled: true
+    serial: ""
+    width: 640
+    height: 480
+    fps: 30
+  wrist_cam:
+    # Wrist-mounted Orbbec Gemini 305.
+    driver: orbbec
+    enabled: true
+    serial: ""
+    width: 640
+    height: 480
+    fps: 30
+
+robot:
+  can_interface: can0
+  dh_is_offset: 1
+  official_can_adapter: true
+  # Keep false until shadow-mode logs and coordinate frames are verified.
+  auto_enable: false
+  # Keep false during the first execute tests.
+  command_gripper: false
+  command_speed_percent: 10
+  control_backend: host_ik_move_j
+  ik_position_tolerance_m: 0.002
+  ik_rotation_tolerance_rad: 0.035
+  ik_max_joint_step_deg: 5.0
+  ik_min_joint_limit_margin_deg: 0.2
+  ik_max_nfev: 60
+  # T_sdk_model_tcp: Piper SDK link6 -> simulated gripper_base TCP.
+  # URDF link6->gripper_base is Rz(pi); the tracked TCP is then +0.1334 m Z.
+  sdk_to_model_translation_m: [0.0, 0.0, 0.1334]
+  sdk_to_model_euler_xyz_rad: [0.0, 0.0, 3.141592653589793]
+
+runtime:
+  # shadow never sends pose/gripper/motion commands.
+  mode: shadow
+  control_hz: 25.0
+  camera_sync_tolerance_ms: 50.0
+  sensor_timeout_ms: 250.0
+  startup_timeout_s: 300.0
+  output_dir: deploy/runs
+  history_indices: [-2, 0]
+
+safety:
+  # Conservative placeholders; calibrate them for the physical table.
+  workspace_min_m: [0.15, -0.35, 0.05]
+  workspace_max_m: [0.60, 0.35, 0.55]
+  max_translation_step_m: 0.015
+  max_rotation_step_rad: 0.12
+  max_action_age_ms: 800.0
+  stale_action_hold_ms: 200.0
+  # DynamicVLA gripper action: +1=open, -1=close.
+  gripper_open_threshold: 0.0
+  gripper_min_m: 0.0
+  gripper_max_m: 0.07
