@@ -25,11 +25,14 @@ deploy/
 ├── configs/      # 外部可修改的YAML配置
 ├── control/      # 与模型和SDK无关的安全过滤
 ├── devices/      # Orbbec、RealSense、Piper厂商适配层
+├── kinematics/   # 主机端IK求解器（SciPy least-squares、Differential、Pink/Pinocchio）
 ├── policy/       # 观测组装、异步模型和LAAS
 ├── tests/        # 不需要硬件的单元测试
-├── tools/        # 日志分析工具
+├── tools/        # 工具集：日志分析、诊断、单关节/位姿移动、遥操作、离线评测等
+├── config.py     # 类型安全的YAML配置加载与校验（~100项检查）
 ├── diagnose.py   # 只读硬件诊断
-└── run.py        # 真机运行入口
+├── run.py        # 真机运行入口
+└── targets.py    # 训练开始关节角常量
 ```
 
 设备模块只负责标准化数据；模型不直接导入厂商SDK；Piper适配层不依赖DynamicVLA。替换相机、机器人或调度器时，不需要修改其他层。
@@ -37,6 +40,16 @@ deploy/
 ## 外部接口
 
 主要配置文件是 `deploy/configs/piper_gemini_d435i.yaml`。
+
+### 预置配置文件
+
+| 文件名 | 模式 | 后端 | 用途 |
+|---|---|---|---|
+| `piper_gemini_d435i.yaml` | shadow | host_ik_move_j | 标准影子模式（默认） |
+| `piper_gemini_d435i_first_execute.yaml` | execute | host_ik_move_j | 首次执行（30s上限，保守限幅） |
+| `piper_sequential.yaml` | shadow | firmware_move_p | 顺序推理模式，无 LAAS 重叠 |
+| `piper_model_tcp_axis_diagnostic.yaml` | shadow | firmware_move_p | 固件 MOVE P 笛卡尔轴诊断 |
+| `piper_model_tcp_axis_hostik_diagnostic.yaml` | shadow | host_ik_move_j | 主机 IK 笛卡尔轴诊断 |
 
 ### 预训练模型路径
 
@@ -122,6 +135,23 @@ robot:
 ```
 
 `auto_enable: false`时运行时不能进入execute。启动Piper只调用CAN连接和反馈读取；只有execute双重确认通过后才调用 `EnableArm`、`MotionCtrl_2`和 `EndPoseCtrl`。夹爪还有独立的 `command_gripper`开关，默认关闭；开启后才调用 `GripperCtrl`。
+
+`feedback_pose_source` 控制 `RobotState.model_vector()` 的末端位姿来源：
+- `endpose`（默认）：直接使用固件 EndPose 反馈。
+- `fk`：对关节反馈执行主机正解（Piper SDK `C_PiperForwardKinematics`），不依赖固件 EndPose。
+
+### 执行后端
+
+`control_backend` 选择运动执行链路：
+
+| 后端 | 说明 |
+|---|---|
+| `host_ik_move_j` | SciPy least-squares 多初值主机 IK → MOVE J |
+| `host_diff_ik_move_j` | 阻尼最小二乘微分 IK（IsaacLab 风格）→ MOVE J |
+| `host_pink_ik_move_j` | Pink + Pinocchio 微分 IK，直接在模型 TCP 帧求解 → MOVE J |
+| `firmware_move_p` | 直接下发笛卡尔位姿目标，由固件黑盒 IK 执行 MOVE P |
+
+各个配置 YAML 可以选择不同的后端。shadow 模式对所有后端都执行 IK 预览和日志诊断。
 
 ## 安装
 
@@ -224,6 +254,78 @@ python -m deploy.run \
 ```
 
 缺少任意一个开关都会拒绝启动。
+
+### Execute 运行时选项
+
+```yaml
+runtime:
+  max_execute_seconds: 60        # 执行时长上限（秒），0 表示不限
+  return_to_training_start_on_normal_exit: true  # 正常退出后自动回到训练开始位姿
+  return_speed_percent: 3        # 返回运动速度 1-10%
+  return_timeout_s: 45           # 返回运动超时
+```
+
+设置 `max_execute_seconds` 可以让 execute 在指定时间后自动停止并返回起始位。异常退出（异常、Ctrl+C）不会触发自动返回。
+
+Execute 模式下运行时还持续监控 Piper CAN 状态：
+
+| 监控项 | 条件 | 行为 |
+|---|---|---|
+| `ctrl_mode` | 非 `0x01` (MOTION_ENABLE) | 立即报错退出 |
+| `mode_feed` | 非期望值 | 立即报错退出 |
+| `arm_status` | 非 `0x00` (STANDBY) | 立即报错退出 |
+| `joint_limit_flags` | 任一关节触发硬限位 | 日志记录后退出 |
+| `motion_status` | 非 `0x00` 时表示运动中 | 用于完成检测 |
+
+### 顺序执行模式（Sequential）
+
+默认 `continuous_inference: true` 使用 LAAS 重叠推理和执行。设置 `continuous_inference: false` 切换为顺序模式：等待上一个动作完成后再推理下一步。
+
+```yaml
+runtime:
+  continuous_inference: false
+  max_trusted_action_steps: 20      # 每次推理使用的前 N 步
+  action_completion_joint_tolerance_deg: 0.5  # 关节到达判定容差
+  action_completion_settle_cycles: 3          # 稳定判定所需连续周期数
+  action_completion_timeout_s: 30.0           # 单步超时
+```
+
+顺序模式通过 `motion_status == 0` 和关节误差判断动作是否完成。适用于 firmware MOVE P 或需要严格顺序执行的场景。
+
+### 动作流保护
+
+```yaml
+safety:
+  hold_on_stale_action: true   # 模型输出断档时保持最后目标等待，而非报错
+  stale_action_hold_ms: 200    # 超过此时间无新动作则触发保护
+```
+
+`hold_on_stale_action` 让运行时在模型推理偶发延迟时保持最后 JointCtrl 目标继续等待，而不是直接退出。默认 `false`（动作断档即退出）。
+
+## 工具集
+
+`tools/` 提供以下硬件和离线工具，均在 `deploy/tools/` 下：
+
+| 工具 | 说明 | 硬件需求 |
+|---|---|---|
+| `summarize_log.py` | 统计 events.jsonl 的事件数、推理延迟、LAAS跳过步数 | 无 |
+| `verify_piper_frames.py` | 采样 EndPose vs FK joint6，验证 `sdk_to_model` 变换准确性 | Piper CAN |
+| `diagnose_piper_cartesian.py` | MOVE P 笛卡尔诊断：发 ~1 mm 目标并测量反馈一致性 | Piper CAN |
+| `enter_teach_mode.py` | 读/切换 Piper 控制模式：STANDBY、MOTION_ENABLE、TEACH | Piper CAN |
+| `jog_piper_joint.py` | 单关节低速点动，校验软限位和 FK 路径 | Piper CAN |
+| `jog_model_tcp_axis.py` | 沿模型 TCP 坐标轴方向微小点动，用 host IK 执行 | Piper CAN |
+| `move_to_joint_zero.py` | 慢速 MOVE J 回到 `[0,0,0,0,0,0]` | Piper CAN |
+| `move_to_joint_pose_and_print_tcp.py` | 移动到指定关节角后持续打印模型 TCP 位姿 | Piper CAN |
+| `move_to_model_tcp_pose.py` | 移动到指定模型 TCP 位置/四元数，用 host IK | Piper CAN |
+| `move_to_training_start.py` | 慢速 MOVE J 回到训练开始关节角，带 FK 路径检查 | Piper CAN |
+| `teleop_model_tcp.py` | 终端交互式遥操作模型 TCP 位姿，使用 Pink IK | Piper CAN |
+| `print_gripper_state.py` | 只读打印夹爪角度/力/状态 | Piper CAN |
+| `counterfactual_rollout.py` | 冻结图像，把上一个模型输出作为下一帧 state，闭环验证 | Piper CAN |
+| `replay_real_episode.py` | 回放 LeRobot episode 的绝对模型 TCP 动作，用 host IK | Piper CAN |
+| `offline_policy_rollout.py` | 在离线 LeRobot parquet 上运行策略，比较预测 vs 数据集动作 | 无 |
+| `offline_policy_dataloader_check.py` | 在 DataLoader sample 上运行策略，验证 delta 动作一致性 | 无 |
+
+所有工具支持 `--help` 查看参数。需要硬件连接的工具在 dry-run 阶段不会发送运动。
 
 ## 功能实现原理
 
@@ -365,4 +467,28 @@ python -m deploy.run \\
 注意：`ik_max_joint_step_deg`是六轴关节增量整体缩放上限，不是速度参数；超过时不再终止，而是保持关节运动方向并按统一比例缩放。`piper_sequential.yaml`额外启用`ik_allow_pose_projection`：当精确末端姿态会贴近关节限位或无精确安全解时，主机IK会在更保守的关节边界内重优化最近可达位姿，优先保位置、允许小幅牺牲姿态，并记录`pose_projected`。Piper的
 `command_speed_percent`仍限制控制器运动速度。`piper_sequential.yaml`还启用`hold_on_stale_action: true`：模型推理偶发超过chunk覆盖时间时不退出，而是保持最后JointCtrl目标等待下一批action。主机IK目前没有环境碰撞模型，不能替代
 桌面、相机、线缆和自碰撞检查。
+
+### Pink + Pinocchio 微分 IK（`host_pink_ik_move_j`）
+
+默认值 `control_backend: host_pink_ik_move_j` 使用 [Pink](https://github.com/stephane-caron/pink) + [Pinocchio](https://github.com/stack-of-tasks/pinocchio) 在模型 TCP 帧直接求解微分 IK：
+
+```yaml
+robot:
+  control_backend: host_pink_ik_move_j
+  pink_urdf_path: simulations/robots/PIPER/piper_description.urdf
+  pink_frame_name: model_tcp
+  pink_solver: proxqp          # proxqp | quadprog
+  pink_dt: 0.04                # 积分步长（秒）
+  pink_position_cost: 1.0      # 位置误差权重
+  pink_orientation_cost: 0.25  # 姿态误差权重
+  pink_posture_cost: 0.01      # 关节姿态正则化权重
+  pink_lm_damping: 0.0001      # Levenberg-Marquardt 阻尼
+  pink_qpsolver_damping: 1e-12 # QP 求解器阻尼
+```
+
+Pink IK 从 URDF 构建 Pinocchio 模型，在 `gripper_base + localZ 0.1334 m` 添加虚拟 `model_tcp` 帧，通过 `FrameTask` + `PostureTask` + QP 求解差分运动，直接输出模型 TCP 空间的速度指令再积分回关节角，避免多初值搜索和显式逆变换。
+
+### 固件 MOVE P（`firmware_move_p`）
+
+`control_backend: firmware_move_p` 跳过主机 IK，由 `piper_sdk.EndPoseCtrl` 直接下发笛卡尔位姿。固件内部执行黑盒 IK。此模式下不生成 `host_ik` / `host_ik_reject` 日志。适合固件端 IK 已验证的场景或简单笛卡尔诊断。
 
