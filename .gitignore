@@ -14,4 +14,5 @@ venv/
 env/
 *.log
 *.orig
+runs/
 .DS_Store
