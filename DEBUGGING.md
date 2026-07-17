@@ -105,7 +105,7 @@ python -m deploy.tools.move_to_training_start \
   --config deploy/configs/piper_gemini_d435i.yaml
 ```
 
-工具统一使用实机标定起始关节 `[0.0, 89.913, -80.913, 0.0, 58.398, 0.0] deg`，定义位于 `deploy/targets.py`。默认MOVE J速度5%，硬限制不超过10%，回位开始和完成时夹爪闭合至0 mm。实际运动必须清空扫掠空间、保持物理急停可达，并显式执行：
+工具统一使用实机标定起始关节 `[0.0, 70.913, -60.913, 0.0, 58.398, 0.0] deg`和完全打开的夹爪目标 `0.07 m`，定义位于 `deploy/targets.py`。默认MOVE J速度5%，硬限制不超过10%，回位开始和完成时均命令夹爪完全打开。实际运动必须清空扫掠空间、保持物理急停可达，并显式执行：
 
 ```bash
 python -m deploy.tools.move_to_training_start \

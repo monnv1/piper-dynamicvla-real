@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import threading
 import time
@@ -10,6 +11,9 @@ import numpy as np
 
 from deploy.common.messages import ActionChunk, PolicyObservation
 from deploy.config import ModelConfig
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 DOM_CHUNK000_DELTA_ACTION_MEAN = np.asarray(
@@ -64,6 +68,24 @@ def override_action_normalization(policy, torch_module) -> None:
     for prefix in ("normalize_targets", "unnormalize_outputs"):
         params[f"{prefix}.buffer_action.mean"].data.copy_(mean)
         params[f"{prefix}.buffer_action.std"].data.copy_(std)
+
+
+def scale_runtime_delta_action_ry_mean(policy, scale: float) -> tuple[float, float]:
+    """Scale only the in-memory output ry mean and return (before, after)."""
+
+    key = "unnormalize_outputs.buffer_action.mean"
+    tensors = dict(policy.named_parameters())
+    tensors.update(dict(policy.named_buffers()))
+    if key not in tensors:
+        raise KeyError(f"Checkpoint is missing normalization tensor: {key}")
+    mean = tensors[key]
+    if mean.numel() <= 4:
+        raise ValueError(
+            f"Delta-action ry mean requires at least 5 action dimensions, got {mean.numel()}"
+        )
+    original = float(mean[4].item())
+    mean.data[4].mul_(scale)
+    return original, float(mean[4].item())
 
 
 def _replace_queue_item(target: queue.Queue, item) -> None:
@@ -147,6 +169,16 @@ class DynamicVLAWorker:
         )
         policy = policy.to(device)
         # override_action_normalization(policy, torch)  # disabled: safetensors already contains delta-action stats
+        ry_mean_before, ry_mean_after = scale_runtime_delta_action_ry_mean(
+            policy, self.config.delta_action_ry_mean_scale
+        )
+        LOGGER.warning(
+            "Deployment-only delta-action ry mean scale=%.3f: %.8f -> %.8f rad "
+            "(checkpoint file unchanged)",
+            self.config.delta_action_ry_mean_scale,
+            ry_mean_before,
+            ry_mean_after,
+        )
         self.chunk_size = int(policy.config.n_action_steps)
         self.ready.set()
 

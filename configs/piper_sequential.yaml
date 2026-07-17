@@ -3,6 +3,8 @@ model:
   device: cuda
   task: pick up the red plastic bottle
   rotation: euler
+  # Runtime-only diagnostic hook; 1.0 disables scaling and never rewrites ckpt.
+  delta_action_ry_mean_scale: 1.0
 
 cameras:
   opst_cam:
@@ -27,7 +29,7 @@ robot:
   auto_enable: true
   # Fine-tuned labels are physical jaw openings in [0, 0.07] m.
   command_gripper: true
-  command_speed_percent: 5
+  command_speed_percent: 10
   control_backend: firmware_move_p
   feedback_pose_source: fk
   ik_position_tolerance_m: 10.0
@@ -60,7 +62,7 @@ robot:
 
 runtime:
   mode: execute
-  control_hz: 25.0
+  control_hz: 40.0
   camera_sync_tolerance_ms: 50.0
   sensor_timeout_ms: 250.0
   startup_timeout_s: 300.0
@@ -71,7 +73,11 @@ runtime:
   # Sequential rollout: infer once, execute the trusted prefix, then infer again.
   continuous_inference: false
   max_trusted_action_steps: 20
-  # Do not advance until firmware and joint feedback both report completion.
+  # Match recording: stream one setpoint every 25 ms without waiting for the
+  # follower arm to reach the preceding target.
+  action_execution_mode: timed
+  action_hz: 40.0
+  # Used only when action_execution_mode is changed to point_to_point.
   action_completion_joint_tolerance_deg: 0.5
   action_completion_settle_cycles: 3
   action_completion_timeout_s: 30.0

@@ -17,6 +17,50 @@ class SchedulerStats:
     executed_actions: int = 0
 
 
+@dataclass(frozen=True)
+class DispatchTiming:
+    target_ns: int
+    actual_ns: int
+    lateness_ns: int
+    skipped_intervals: int
+
+
+class FixedRateGate:
+    """Monotonic fixed-rate gate that never emits catch-up bursts."""
+
+    def __init__(self, frequency_hz: float) -> None:
+        if frequency_hz <= 0:
+            raise ValueError("frequency_hz must be positive")
+        self.period_ns = int(round(1_000_000_000 / frequency_hz))
+        self._next_ns: int | None = None
+
+    def arm(self, now_ns: int) -> None:
+        self._next_ns = now_ns
+
+    def ready(self, now_ns: int) -> bool:
+        return self._next_ns is not None and now_ns >= self._next_ns
+
+    def consume(self, now_ns: int) -> DispatchTiming:
+        if not self.ready(now_ns):
+            raise RuntimeError("Fixed-rate gate was consumed before its deadline")
+        assert self._next_ns is not None
+        target_ns = self._next_ns
+        lateness_ns = max(0, now_ns - target_ns)
+        skipped_intervals = lateness_ns // self.period_ns
+        # A late control loop schedules the next action one full period from
+        # now. It never immediately replays missed setpoints in a burst.
+        if lateness_ns:
+            self._next_ns = now_ns + self.period_ns
+        else:
+            self._next_ns = target_ns + self.period_ns
+        return DispatchTiming(
+            target_ns=target_ns,
+            actual_ns=now_ns,
+            lateness_ns=lateness_ns,
+            skipped_intervals=int(skipped_intervals),
+        )
+
+
 class ActionScheduler:
     """Timestamp-aware replacement for the upstream LAAS queue."""
 

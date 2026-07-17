@@ -11,12 +11,16 @@ def test_sequential_config_only_retains_command_speed_limit() -> None:
     config = load_config(SEQUENTIAL_CONFIG)
 
     assert config.model.checkpoint == "/data/checkpoints/dynamicvla_merged"
+    assert config.model.delta_action_ry_mean_scale == pytest.approx(1.0)
     assert not config.runtime.continuous_inference
     assert config.runtime.max_trusted_action_steps == 20
+    assert config.runtime.action_execution_mode == "timed"
+    assert config.runtime.action_hz == pytest.approx(40.0)
+    assert config.runtime.control_hz == pytest.approx(40.0)
     assert config.runtime.action_completion_joint_tolerance_deg == pytest.approx(0.5)
     assert config.runtime.action_completion_settle_cycles == 3
     assert config.runtime.action_completion_timeout_s == pytest.approx(30.0)
-    assert config.robot.command_speed_percent == 5
+    assert config.robot.command_speed_percent == 10
     assert config.robot.control_backend == "firmware_move_p"
     assert not config.safety.enforce_workspace
     assert config.safety.max_translation_step_m == pytest.approx(10.0)
@@ -41,4 +45,28 @@ def test_future_history_index_is_rejected(tmp_path: Path) -> None:
     path.write_text("runtime:\n  history_indices: [-2, 1, 0]\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="future observations"):
+        load_config(path)
+
+
+def test_delta_action_ry_mean_scale_is_bounded(tmp_path: Path) -> None:
+    path = tmp_path / "bad.yaml"
+    path.write_text(
+        "model:\n  delta_action_ry_mean_scale: 1.1\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="delta_action_ry_mean_scale"):
+        load_config(path)
+
+
+def test_action_hz_cannot_exceed_control_hz(tmp_path: Path) -> None:
+    path = tmp_path / "bad.yaml"
+    path.write_text(
+        "runtime:\n"
+        "  control_hz: 25\n"
+        "  action_execution_mode: timed\n"
+        "  action_hz: 40\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="action_hz"):
         load_config(path)
