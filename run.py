@@ -17,7 +17,7 @@ from deploy.control.safety_filter import SafetyFilter, SafetyViolation
 from deploy.devices.factory import create_camera
 from deploy.kinematics import HostIKError
 from deploy.devices.piper_robot import PiperRobot
-from deploy.policy.action_scheduler import ActionScheduler
+from deploy.policy.action_scheduler import ActionScheduler, FixedRateGate
 from deploy.policy.inference_worker import DynamicVLAWorker
 from deploy.policy.observation_builder import ObservationBuilder
 from deploy.targets import TRAINING_START_DEG, TRAINING_START_GRIPPER_M
@@ -163,6 +163,10 @@ class DeploymentRuntime:
         stale_action_hold_logged = False
         execute_deadline_ns = None
         sequential_inference = not self.config.runtime.continuous_inference
+        point_to_point_execution = (
+            self.config.runtime.action_execution_mode == "point_to_point"
+        )
+        timed_action_gate = FixedRateGate(self.config.runtime.action_hz)
         inference_pending = False
         awaiting_action_completion = False
         action_completion_settle_count = 0
@@ -244,7 +248,12 @@ class DeploymentRuntime:
                     },
                 }
 
-            if sequential_inference and execute and awaiting_action_completion:
+            if (
+                sequential_inference
+                and point_to_point_execution
+                and execute
+                and awaiting_action_completion
+            ):
                 selected_joint_degrees = previous_command["selected_joint_degrees"]
                 current_joint_degrees = np.degrees(state.joint_radians)
                 if selected_joint_degrees is None:
@@ -340,6 +349,8 @@ class DeploymentRuntime:
                         else None
                     ),
                 )
+                if accepted and sequential_inference and not point_to_point_execution:
+                    timed_action_gate.arm(now_ns)
                 self.log.write(
                     "action_chunk",
                     index=index,
@@ -367,11 +378,22 @@ class DeploymentRuntime:
                     ),
                 )
 
-            scheduled = (
-                self.scheduler.pop_next()
-                if sequential_inference and not awaiting_action_completion
-                else self.scheduler.pop(index) if not sequential_inference else None
-            )
+            dispatch_timing = None
+            if sequential_inference and point_to_point_execution:
+                scheduled = (
+                    self.scheduler.pop_next()
+                    if not awaiting_action_completion
+                    else None
+                )
+            elif sequential_inference:
+                if timed_action_gate.ready(now_ns):
+                    scheduled = self.scheduler.pop_next()
+                    if scheduled is not None:
+                        dispatch_timing = timed_action_gate.consume(now_ns)
+                else:
+                    scheduled = None
+            else:
+                scheduled = self.scheduler.pop(index)
             if scheduled is not None:
                 stale_action_hold_logged = False
                 command_details = self.robot.describe_action(scheduled.action)
@@ -501,6 +523,18 @@ class DeploymentRuntime:
                             "arm_status": state.arm_status,
                             "motion_status": state.motion_status,
                         },
+                        action_execution_mode=self.config.runtime.action_execution_mode,
+                        dispatch_timing=(
+                            None
+                            if dispatch_timing is None
+                            else {
+                                "target_ns": dispatch_timing.target_ns,
+                                "actual_ns": dispatch_timing.actual_ns,
+                                "lateness_ms": dispatch_timing.lateness_ns
+                                / 1_000_000.0,
+                                "skipped_intervals": dispatch_timing.skipped_intervals,
+                            }
+                        ),
                     )
                     if execute:
                         command_result = self.robot.command_action(
@@ -520,7 +554,7 @@ class DeploymentRuntime:
                             ),
                             "planned_tcp_model": command_details["model_tcp"],
                         }
-                        if sequential_inference:
+                        if sequential_inference and point_to_point_execution:
                             awaiting_action_completion = True
                             action_completion_settle_count = 0
             elif (
@@ -566,6 +600,10 @@ def main() -> None:
     parser.add_argument("--mode", choices=["shadow", "execute"])
     parser.add_argument("--checkpoint")
     parser.add_argument("--task")
+    parser.add_argument(
+        "--action-execution-mode", choices=["point_to_point", "timed"]
+    )
+    parser.add_argument("--action-hz", type=float)
     parser.add_argument("--confirm-motion", action="store_true")
     args = parser.parse_args()
 
@@ -576,6 +614,17 @@ def main() -> None:
         config.model.checkpoint = args.checkpoint
     if args.task:
         config.model.task = args.task
+    if args.action_execution_mode:
+        config.runtime.action_execution_mode = args.action_execution_mode
+    if args.action_hz is not None:
+        if args.action_hz <= 0:
+            parser.error("--action-hz must be positive")
+        config.runtime.action_hz = args.action_hz
+    if (
+        config.runtime.action_execution_mode == "timed"
+        and config.runtime.action_hz > config.runtime.control_hz
+    ):
+        parser.error("timed action_hz must be <= runtime.control_hz")
     if not Path(config.model.checkpoint).expanduser().is_dir():
         raise FileNotFoundError(f"Invalid checkpoint: {config.model.checkpoint}")
 

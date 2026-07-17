@@ -90,6 +90,10 @@ class RuntimeConfig:
     # mode waits for the trusted prefix to finish before starting inference.
     continuous_inference: bool = True
     max_trusted_action_steps: int = 20
+    # Sequential chunks can either wait for every setpoint to complete or
+    # stream one setpoint per fixed wall-clock interval, as during recording.
+    action_execution_mode: str = "point_to_point"
+    action_hz: float = 40.0
     action_completion_joint_tolerance_deg: float = 0.5
     action_completion_settle_cycles: int = 3
     action_completion_timeout_s: float = 30.0
@@ -179,6 +183,17 @@ def load_config(path: str | Path) -> DeployConfig:
         raise ValueError("runtime.video_fps must be positive")
     if config.runtime.max_trusted_action_steps <= 0:
         raise ValueError("runtime.max_trusted_action_steps must be positive")
+    if config.runtime.action_execution_mode not in {"point_to_point", "timed"}:
+        raise ValueError(
+            "runtime.action_execution_mode must be 'point_to_point' or 'timed'"
+        )
+    if config.runtime.action_hz <= 0:
+        raise ValueError("runtime.action_hz must be positive")
+    if (
+        config.runtime.action_execution_mode == "timed"
+        and config.runtime.action_hz > config.runtime.control_hz
+    ):
+        raise ValueError("runtime.action_hz cannot exceed runtime.control_hz")
     if config.runtime.action_completion_joint_tolerance_deg <= 0:
         raise ValueError(
             "runtime.action_completion_joint_tolerance_deg must be positive"

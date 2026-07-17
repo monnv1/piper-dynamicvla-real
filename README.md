@@ -47,7 +47,7 @@ deploy/
 |---|---|---|---|
 | `piper_gemini_d435i.yaml` | shadow | host_ik_move_j | 标准影子模式（默认） |
 | `piper_gemini_d435i_first_execute.yaml` | execute | host_ik_move_j | 首次执行（30s上限，保守限幅） |
-| `piper_sequential.yaml` | shadow | firmware_move_p | 顺序推理模式，无 LAAS 重叠 |
+| `piper_sequential.yaml` | execute | firmware_move_p | 40 Hz 定时下发，无 LAAS 重叠 |
 | `piper_model_tcp_axis_diagnostic.yaml` | shadow | firmware_move_p | 固件 MOVE P 笛卡尔轴诊断 |
 | `piper_model_tcp_axis_hostik_diagnostic.yaml` | shadow | host_ik_move_j | 主机 IK 笛卡尔轴诊断 |
 
@@ -279,18 +279,33 @@ Execute 模式下运行时还持续监控 Piper CAN 状态：
 
 ### 顺序执行模式（Sequential）
 
-默认 `continuous_inference: true` 使用 LAAS 重叠推理和执行。设置 `continuous_inference: false` 切换为顺序模式：等待上一个动作完成后再推理下一步。
+默认 `continuous_inference: true` 使用 LAAS 重叠推理和执行。设置 `continuous_inference: false` 后，每个 chunk 依次执行，并通过 `action_execution_mode` 选择两种下发方式：
+
+- `timed`：按 `action_hz` 固定时间间隔发送 setpoint，不等待从臂到位；控制循环超时时不会突发补发漏掉的点。
+- `point_to_point`：等待固件停止且关节误差稳定后，再发送下一个 setpoint，保留原来的执行行为。
 
 ```yaml
 runtime:
   continuous_inference: false
   max_trusted_action_steps: 20      # 每次推理使用的前 N 步
+  action_execution_mode: timed      # timed 或 point_to_point
+  control_hz: 40.0                  # 必须不低于 action_hz
+  action_hz: 40.0                   # 每 25 ms 下发一个动作
   action_completion_joint_tolerance_deg: 0.5  # 关节到达判定容差
   action_completion_settle_cycles: 3          # 稳定判定所需连续周期数
   action_completion_timeout_s: 30.0           # 单步超时
 ```
 
-顺序模式通过 `motion_status == 0` 和关节误差判断动作是否完成。适用于 firmware MOVE P 或需要严格顺序执行的场景。
+三个 `action_completion_*` 参数只在 `point_to_point` 模式生效。命令行可临时覆盖：
+
+```bash
+python -m deploy.run \
+  --config deploy/configs/piper_sequential.yaml \
+  --action-execution-mode point_to_point \
+  --checkpoint /path/to/checkpoint \
+  --mode execute \
+  --confirm-motion
+```
 
 ### 动作流保护
 
@@ -491,4 +506,3 @@ Pink IK 从 URDF 构建 Pinocchio 模型，在 `gripper_base + localZ 0.1334 m` 
 ### 固件 MOVE P（`firmware_move_p`）
 
 `control_backend: firmware_move_p` 跳过主机 IK，由 `piper_sdk.EndPoseCtrl` 直接下发笛卡尔位姿。固件内部执行黑盒 IK。此模式下不生成 `host_ik` / `host_ik_reject` 日志。适合固件端 IK 已验证的场景或简单笛卡尔诊断。
-

@@ -1,7 +1,7 @@
 import numpy as np
 
 from deploy.common.messages import ActionChunk
-from deploy.policy.action_scheduler import ActionScheduler
+from deploy.policy.action_scheduler import ActionScheduler, FixedRateGate
 
 
 def chunk(origin: int, now_ns: int = 1_000_000_000, episode: str = "episode"):
@@ -117,3 +117,35 @@ def test_pop_next_preserves_actions_while_wall_clock_advances():
     np.testing.assert_array_equal(third.action, chunk(0).actions[2])
     assert scheduler.pop_next() is None
     assert scheduler.stats.expired_actions == 0
+
+
+def test_fixed_rate_gate_dispatches_at_requested_period():
+    gate = FixedRateGate(40.0)
+    gate.arm(1_000_000_000)
+
+    assert gate.ready(1_000_000_000)
+    first = gate.consume(1_000_000_000)
+    assert first.lateness_ns == 0
+    assert not gate.ready(1_024_999_999)
+    assert gate.ready(1_025_000_000)
+
+
+def test_fixed_rate_gate_does_not_catch_up_after_overrun():
+    gate = FixedRateGate(40.0)
+    gate.arm(1_000_000_000)
+    gate.consume(1_000_000_000)
+
+    late = gate.consume(1_100_000_000)
+
+    assert late.skipped_intervals == 3
+    assert not gate.ready(1_124_999_999)
+    assert gate.ready(1_125_000_000)
+
+
+def test_fixed_rate_gate_preserves_spacing_after_small_delay():
+    gate = FixedRateGate(40.0)
+    gate.arm(1_000_000_000)
+    gate.consume(1_005_000_000)
+
+    assert not gate.ready(1_029_999_999)
+    assert gate.ready(1_030_000_000)
