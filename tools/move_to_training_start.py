@@ -7,7 +7,11 @@ import numpy as np
 
 from deploy.config import load_config
 from deploy.devices.piper_frames import PiperFrameTransform
-from deploy.targets import TRAINING_START_DEG, TRAINING_START_RAD
+from deploy.targets import (
+    TRAINING_START_DEG,
+    TRAINING_START_GRIPPER_M,
+    TRAINING_START_RAD,
+)
 
 
 JOINT_LIMITS_DEG = np.asarray(
@@ -36,6 +40,7 @@ STATUS_NAMES = {
 }
 
 CONFIRM_TEXT = "MOVE_PIPER_SLOWLY_TO_TRAINING_START"
+GRIPPER_ZERO_CONFIRM_TEXT = "GRIPPER_IS_PHYSICALLY_CLOSED_SET_ZERO"
 
 
 def arm_status_code(piper) -> int:
@@ -128,6 +133,149 @@ def send_joint_target(piper, target_deg: np.ndarray, speed_percent: int) -> None
     piper.JointCtrl(*target_units.tolist())
 
 
+def send_gripper_target(piper, target_m: float) -> None:
+    if not np.isfinite(target_m) or not 0.0 <= target_m <= 0.1:
+        raise ValueError("Gripper target must be finite and in [0, 0.1] m")
+    target_units = int(round(target_m * 1_000_000.0))
+    piper.GripperCtrl(target_units, 1000, 0x01, 0x00)
+
+
+def set_gripper_zero_at_closed_position(piper) -> None:
+    """Run the Piper V2 official gripper-zero command sequence."""
+    message = piper.GetArmGripperMsgs()
+    if float(getattr(message, "Hz", 0.0)) <= 0:
+        raise RuntimeError("No Piper gripper feedback; refusing to set zero")
+    state = message.gripper_state
+    if bool(getattr(state.foc_status, "homing_status", False)):
+        print("Gripper is already zeroed; skipping zero calibration.")
+        return
+
+    print("\nGRIPPER ZERO CALIBRATION REQUIRED")
+    print("- Physically close the gripper fingers completely before continuing.")
+    print("- Remove every object, finger and tool from between the jaws.")
+    print("- This writes the current physical position as the permanent 0 mm point.")
+    typed = input(
+        f"Type exactly {GRIPPER_ZERO_CONFIRM_TEXT} to set gripper zero: "
+    ).strip()
+    if typed != GRIPPER_ZERO_CONFIRM_TEXT:
+        raise RuntimeError("Gripper-zero confirmation did not match; zero not changed")
+
+    # Exact sequence from piper_sdk/demo/V2/piper_set_gripper_zero.py.
+    piper.GripperCtrl(0, 1000, 0x00, 0x00)
+    time.sleep(1.5)
+    piper.GripperCtrl(0, 1000, 0x00, 0xAE)
+    time.sleep(0.5)
+
+    message = piper.GetArmGripperMsgs()
+    reported_homed = bool(
+        getattr(message.gripper_state.foc_status, "homing_status", False)
+    )
+    print(
+        "Official gripper-zero command sent; controller homing_status=",
+        reported_homed,
+        "(this firmware flag is informational, not an acknowledgement)",
+    )
+
+
+def move_gripper_and_wait(
+    piper,
+    target_m: float,
+    timeout_s: float = 8.0,
+    tolerance_m: float = 0.002,
+) -> float:
+    """Clear gripper errors, enable it, and command until feedback settles."""
+    if not np.isfinite(target_m) or not 0.0 <= target_m <= 0.1:
+        raise ValueError("Gripper target must be finite and in [0, 0.1] m")
+    if timeout_s <= 0 or tolerance_m <= 0:
+        raise ValueError("Gripper timeout and tolerance must be positive")
+
+    feedback_deadline = time.monotonic() + min(timeout_s, 2.0)
+    message = None
+    while time.monotonic() < feedback_deadline:
+        message = piper.GetArmGripperMsgs()
+        if float(getattr(message, "Hz", 0.0)) > 0:
+            break
+        time.sleep(0.02)
+    if message is None or float(getattr(message, "Hz", 0.0)) <= 0:
+        raise RuntimeError("No Piper gripper feedback; refusing blind gripper motion")
+
+    current_units = int(message.gripper_state.grippers_angle)
+    initial_foc = message.gripper_state.foc_status
+    print(
+        "Gripper preflight:",
+        f"feedback={current_units / 1000.0:.2f} mm",
+        f"enabled={bool(getattr(initial_foc, 'driver_enable_status', False))}",
+        f"homed={bool(getattr(initial_foc, 'homing_status', False))}",
+    )
+    if not bool(getattr(initial_foc, "homing_status", False)):
+        print(
+            "WARNING: controller reports homing_status=False; continuing because "
+            "some Piper firmware does not acknowledge set_zero through this bit. "
+            "Actual position feedback will determine success."
+        )
+    target_units = int(round(target_m * 1_000_000.0))
+    # Follow the Piper V2 initialization sequence: clear errors while disabled,
+    # then enable while clearing errors before streaming position commands.
+    piper.GripperCtrl(current_units, 1000, 0x02, 0x00)
+    time.sleep(0.05)
+    piper.GripperCtrl(current_units, 1000, 0x03, 0x00)
+    time.sleep(0.15)
+
+    deadline = time.monotonic() + timeout_s
+    settled_samples = 0
+    last_print = 0.0
+    last_m = current_units / 1_000_000.0
+    while time.monotonic() < deadline:
+        send_gripper_target(piper, target_m)
+        message = piper.GetArmGripperMsgs()
+        if float(getattr(message, "Hz", 0.0)) <= 0:
+            raise RuntimeError("Piper gripper feedback stopped during motion")
+        state = message.gripper_state
+        last_m = float(state.grippers_angle) / 1_000_000.0
+        foc = state.foc_status
+        fault_names = [
+            name
+            for name in (
+                "voltage_too_low",
+                "motor_overheating",
+                "driver_overcurrent",
+                "driver_overheating",
+                "sensor_status",
+                "driver_error_status",
+            )
+            if bool(getattr(foc, name, False))
+        ]
+        if fault_names:
+            raise RuntimeError("Piper gripper fault: " + ", ".join(fault_names))
+
+        now = time.monotonic()
+        if now - last_print >= 0.5:
+            print(
+                "gripper_mm=",
+                round(last_m * 1000.0, 2),
+                "target_mm=",
+                round(target_m * 1000.0, 2),
+                "enabled=",
+                bool(getattr(foc, "driver_enable_status", False)),
+                "homed=",
+                bool(getattr(foc, "homing_status", False)),
+            )
+            last_print = now
+        if abs(last_m - target_m) <= tolerance_m:
+            settled_samples += 1
+            if settled_samples >= 5:
+                return last_m
+        else:
+            settled_samples = 0
+        time.sleep(0.01)
+
+    raise TimeoutError(
+        "Gripper did not reach the training-start opening within "
+        f"{timeout_s:.1f}s: feedback={last_m * 1000.0:.2f} mm, "
+        f"target={target_m * 1000.0:.2f} mm"
+    )
+
+
 def sample_model_tcp_path(
     current_deg: np.ndarray,
     dh_is_offset: int,
@@ -174,7 +322,11 @@ def print_plan(
     print("Joint deltas   (deg):", np.round(delta, 3).tolist())
     print("Largest joint delta:", round(float(np.max(np.abs(delta))), 3), "deg")
     print("MOVE J speed:", speed_percent, "%")
-    print("Gripper: close to 0 mm at return start and keep closed")
+    print(
+        "Gripper target:",
+        round(TRAINING_START_GRIPPER_M * 1000.0, 1),
+        "mm (fully open)",
+    )
     print("Approx model-TCP path min (m):", np.round(tcp_path.min(axis=0), 4).tolist())
     print("Approx model-TCP path max (m):", np.round(tcp_path.max(axis=0), 4).tolist())
     print("SDK-FK model TCP at target (m):", np.round(tcp_path[-1], 4).tolist())
@@ -225,6 +377,16 @@ def main() -> None:
         action="store_true",
         help="Second motion gate; an interactive confirmation is still required",
     )
+    parser.add_argument(
+        "--gripper-only",
+        action="store_true",
+        help="Open and verify the training-start gripper target without moving joints",
+    )
+    parser.add_argument(
+        "--set-gripper-zero",
+        action="store_true",
+        help="If unhomed, explicitly set the physically closed gripper as 0 mm",
+    )
     args = parser.parse_args()
 
     if not 1 <= args.speed_percent <= 10:
@@ -238,6 +400,16 @@ def main() -> None:
 
     config = load_config(args.config)
     validate_joint_values(TRAINING_START_DEG, "training target", margin_deg=0.5)
+    if not (
+        config.safety.gripper_min_m
+        <= TRAINING_START_GRIPPER_M
+        <= config.safety.gripper_max_m
+    ):
+        raise ValueError(
+            "Training-start gripper target is outside the configured gripper range: "
+            f"target={TRAINING_START_GRIPPER_M}, "
+            f"range=[{config.safety.gripper_min_m}, {config.safety.gripper_max_m}]"
+        )
     frames = PiperFrameTransform(
         config.robot.sdk_to_model_translation_m,
         config.robot.sdk_to_model_euler_xyz_rad,
@@ -294,9 +466,20 @@ def main() -> None:
         # Mark cleanup as required before the first enable command. This also
         # guarantees a hold-position command if enable feedback itself times out.
         motion_started = True
-        enable_with_timeout(piper, timeout_s=5.0)
-        piper.GripperCtrl(0, 1000, 0x01, 0x00)
+        # Match the follower-arm initialization used to collect the real
+        # red_cube dataset: restore default CAN IDs and select motion-output mode.
+        piper.MasterSlaveConfig(0xFC, 0x00, 0x00, 0x00)
         time.sleep(0.2)
+        enable_with_timeout(piper, timeout_s=5.0)
+        if args.set_gripper_zero:
+            set_gripper_zero_at_closed_position(piper)
+        reached_gripper_m = move_gripper_and_wait(
+            piper, TRAINING_START_GRIPPER_M
+        )
+        print("Gripper opened to:", round(reached_gripper_m * 1000.0, 2), "mm")
+        if args.gripper_only:
+            print("Gripper-only check complete; joint return was not started.")
+            return
         resumed = resume_position_control(piper)
         print("Position control active at:", np.round(resumed, 3).tolist())
         def move_phase(target_deg: np.ndarray, label: str) -> None:
@@ -354,7 +537,7 @@ def main() -> None:
         phase1[4] = resumed[4]
         move_phase(phase1, "J1/J2/J3/J4/J6 first, keep J5 current")
         move_phase(TRAINING_START_DEG, "J5 last")
-        piper.GripperCtrl(0, 1000, 0x01, 0x00)
+        move_gripper_and_wait(piper, TRAINING_START_GRIPPER_M)
         print("Target reached and stable within tolerance.")
     except KeyboardInterrupt:
         print("\nInterrupted; terminating motion and holding the current position.")

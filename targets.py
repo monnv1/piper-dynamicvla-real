@@ -10,3 +10,7 @@ TRAINING_START_DEG = np.asarray(
     dtype=np.float64,
 )
 TRAINING_START_RAD = np.radians(TRAINING_START_DEG)
+
+# The training episode starts with the Piper gripper fully open. Piper SDK
+# gripper commands use micrometres, while deployment targets use metres.
+TRAINING_START_GRIPPER_M = 0.07

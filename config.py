@@ -24,6 +24,9 @@ class ModelConfig:
     device: str = "cuda"
     task: str = "place the object into the container"
     rotation: str = "euler"
+    # Deployment-only scale applied in memory to delta-action ry mean.
+    # This never rewrites the checkpoint on disk.
+    delta_action_ry_mean_scale: float = 1.0
 
 
 @dataclass
@@ -156,6 +159,8 @@ def load_config(path: str | Path) -> DeployConfig:
         raise ValueError("runtime.mode must be 'shadow' or 'execute'")
     if config.model.rotation != "euler":
         raise ValueError("The current Piper adapter requires model.rotation=euler")
+    if not 0.0 <= config.model.delta_action_ry_mean_scale <= 1.0:
+        raise ValueError("model.delta_action_ry_mean_scale must be in [0, 1]")
     if config.runtime.control_hz <= 0:
         raise ValueError("runtime.control_hz must be positive")
     if not config.runtime.history_indices or config.runtime.history_indices[-1] != 0:

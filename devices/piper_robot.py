@@ -117,6 +117,10 @@ class PiperRobot:
         if self._piper is None:
             raise RuntimeError("Piper is not connected")
 
+        # Match the follower-arm role used during real-data collection. This
+        # also restores the default feedback/control CAN-ID offsets.
+        self._piper.MasterSlaveConfig(0xFC, 0x00, 0x00, 0x00)
+        time.sleep(0.2)
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             if self._piper.EnablePiper():
@@ -409,7 +413,7 @@ class PiperRobot:
         timeout_s: float,
         workspace_min_m: np.ndarray,
         workspace_max_m: np.ndarray,
-        close_gripper: bool = False,
+        gripper_target_m: float | None = None,
         tolerance_deg: float = 1.5,
     ) -> np.ndarray:
         """Move slowly in MOVE J and leave the final measured pose holding."""
@@ -420,6 +424,10 @@ class PiperRobot:
             raise ValueError("Joint target must contain six finite degrees")
         if not 1 <= speed_percent <= 10:
             raise ValueError("Joint return speed must be in [1, 10]")
+        if gripper_target_m is not None and (
+            not np.isfinite(gripper_target_m) or not 0.0 <= gripper_target_m <= 0.1
+        ):
+            raise ValueError("Gripper target must be finite and in [0, 0.1] m")
 
         current = self._read_joint_degrees()
         self._validate_joint_path_workspace(
@@ -453,9 +461,18 @@ class PiperRobot:
                 f"0x{initial_status_code:02X}"
             )
 
-        if close_gripper:
-            self._piper.GripperCtrl(0, 1000, 0x01, 0x00)
-            time.sleep(0.2)
+        gripper_units = (
+            None
+            if gripper_target_m is None
+            else int(round(gripper_target_m * 1_000_000.0))
+        )
+        if gripper_units is not None:
+            current_gripper = self._read_gripper_m()
+            current_gripper_units = int(round(current_gripper * 1_000_000.0))
+            self._piper.GripperCtrl(current_gripper_units, 1000, 0x02, 0x00)
+            time.sleep(0.05)
+            self._piper.GripperCtrl(current_gripper_units, 1000, 0x03, 0x00)
+            time.sleep(0.15)
 
         target_units = np.rint(target * 1000.0).astype(int)
         deadline = time.monotonic() + timeout_s
@@ -470,12 +487,21 @@ class PiperRobot:
                 )
             self._piper.MotionCtrl_2(0x01, 0x01, speed_percent, 0x00)
             self._piper.JointCtrl(*target_units.tolist())
+            if gripper_units is not None:
+                self._piper.GripperCtrl(gripper_units, 1000, 0x01, 0x00)
             current = self._read_joint_degrees()
-            if float(np.max(np.abs(target - current))) <= tolerance_deg:
+            gripper_reached = (
+                gripper_target_m is None
+                or abs(self._read_gripper_m() - gripper_target_m) <= 0.002
+            )
+            if (
+                float(np.max(np.abs(target - current))) <= tolerance_deg
+                and gripper_reached
+            ):
                 settled += 1
                 if settled >= 5:
-                    if close_gripper:
-                        self._piper.GripperCtrl(0, 1000, 0x01, 0x00)
+                    if gripper_units is not None:
+                        self._piper.GripperCtrl(gripper_units, 1000, 0x01, 0x00)
                     self._hold_current_position()
                     return current
             else:

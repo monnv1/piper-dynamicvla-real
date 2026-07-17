@@ -3,6 +3,9 @@ model:
   device: cuda
   task: pick up the red plastic bottle
   rotation: euler
+  # Temporary deployment-only diagnostic: -4.98 deg becomes about -2.49 deg.
+  # Applied after loading and never saved back into the checkpoint.
+  delta_action_ry_mean_scale: 1.0
 
 cameras:
   opst_cam:

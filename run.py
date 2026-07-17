@@ -20,7 +20,7 @@ from deploy.devices.piper_robot import PiperRobot
 from deploy.policy.action_scheduler import ActionScheduler
 from deploy.policy.inference_worker import DynamicVLAWorker
 from deploy.policy.observation_builder import ObservationBuilder
-from deploy.targets import TRAINING_START_DEG
+from deploy.targets import TRAINING_START_DEG, TRAINING_START_GRIPPER_M
 
 
 class DeploymentRuntime:
@@ -99,12 +99,12 @@ class DeploymentRuntime:
                     timeout_s=self.config.runtime.return_timeout_s,
                     workspace_min_m=self.config.safety.workspace_min_m,
                     workspace_max_m=self.config.safety.workspace_max_m,
-                    close_gripper=True,
+                    gripper_target_m=TRAINING_START_GRIPPER_M,
                 )
                 self.log.write(
                     "return_to_training_start_complete",
                     reached_deg=reached,
-                    gripper_target_m=0.0,
+                    gripper_target_m=TRAINING_START_GRIPPER_M,
                 )
         finally:
             self.worker.stop()
